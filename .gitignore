@@ -1,2 +1,6 @@
 bin/
 obj/*
+*.o
+.vscode/
+.~lock.*
+.DS_Store
