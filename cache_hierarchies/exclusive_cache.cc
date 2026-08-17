@@ -39,6 +39,52 @@ void CACHE::handle_fill()
 
         uint32_t mshr_index = MSHR.next_fill_index;
 
+        // EXCLUSIVE CACHE: For L2C, when returning data to L1 (fill_level < FILL_L2),
+        // do not fill L2C; simply forward data to L1 and complete MSHR.
+        if (cache_type == IS_L2C && MSHR.entry[mshr_index].fill_level < fill_level)
+        {
+            if (MSHR.entry[mshr_index].type == LOAD_TRANSLATION || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D)
+            {
+                extra_interface->return_data(&MSHR.entry[mshr_index]);
+            }
+            else
+            {
+                if (MSHR.entry[mshr_index].send_both_cache)
+                {
+                    upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                    upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                }
+                else if (MSHR.entry[mshr_index].fill_l1i || MSHR.entry[mshr_index].fill_l1d)
+                {
+                    if (MSHR.entry[mshr_index].fill_l1i)
+                        upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                    if (MSHR.entry[mshr_index].fill_l1d)
+                        upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                }
+                else if (MSHR.entry[mshr_index].instruction)
+                    upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                else if (MSHR.entry[mshr_index].is_data)
+                    upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+            }
+
+            // COLLECT STATS
+            sim_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
+            if (MSHR.entry[mshr_index].instruction == 1)
+                sim_instr_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
+            sim_access[fill_cpu][MSHR.entry[mshr_index].type]++;
+
+            if (warmup_complete[fill_cpu])
+            {
+                uint64_t current_miss_latency = (current_core_cycle[fill_cpu] - MSHR.entry[mshr_index].cycle_enqueued);
+                total_miss_latency += current_miss_latency;
+            }
+
+            MSHR.remove_queue(&MSHR.entry[mshr_index]);
+            MSHR.num_returned--;
+            update_fill_cycle();
+            return;
+        }
+
         // find victim
         uint32_t set = get_set(MSHR.entry[mshr_index].address), way;
         way = (this->*find_victim)(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
@@ -196,8 +242,16 @@ void CACHE::handle_fill()
 
 
 
-        // is this dirty?
-        if (block[set][way].dirty) {
+        // EXCLUSIVE CACHE: L1 evicts ANY valid line (clean or dirty) to L2C WQ.
+        // Other levels (or non-exclusive) only writeback dirty lines.
+        bool need_writeback = false;
+        if (cache_type == IS_L1D || cache_type == IS_L1I) {
+            need_writeback = (block[set][way].valid == 1);
+        } else {
+            need_writeback = (block[set][way].dirty == 1);
+        }
+
+        if (need_writeback) {
 
             // check if the lower level WQ has enough room to keep this writeback request
             if (lower_level) {
@@ -225,6 +279,8 @@ void CACHE::handle_fill()
                     writeback_packet.ip = 0; // writeback does not have ip
                     writeback_packet.type = WRITEBACK;
                     writeback_packet.event_cycle = current_core_cycle[fill_cpu];
+                    if (block[set][way].instruction)
+                        writeback_packet.instruction = 1;
 
                     lower_level->add_wq(&writeback_packet);
                 }
@@ -1404,6 +1460,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
                         else if (RQ.entry[index].is_data)
                             upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);
+
+                        // EXCLUSIVE CACHE: Invalidate line in L2C since it is returned to L1
+                        if (RQ.entry[index].fill_level < fill_level) {
+                            block[set][way].valid = 0;
+                        }
                     }
                     else	
                     {
@@ -2073,6 +2134,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                                     PQ.entry[index].data = block[set][way].data;
                                     upper_level_dcache[prefetch_cpu]->return_data(&PQ.entry[index]);
                                 }
+
+                                // EXCLUSIVE CACHE: Invalidate line in L2C if returned to L1
+                                if (PQ.entry[index].fill_level < fill_level) {
+                                    block[set][way].valid = 0;
+                                }
                             }
                             else
                             {
@@ -2487,6 +2553,28 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
             block[set][way].cpu = packet->cpu;
             block[set][way].instr_id = packet->instr_id;
 
+#ifdef EXCLUSIVITY_CHECK
+            if (cache_type == IS_L1D || cache_type == IS_L1I) {
+                PACKET chk = *packet;
+                int l2_hit = ooo_cpu[packet->cpu].L2C.check_hit(&chk);
+                if (l2_hit >= 0) {
+                    cerr << "[" << NAME << "_EXCLUSIVITY_ERROR] Address " << hex << packet->address << dec 
+                         << " filled in " << NAME << " but already present in L2C way " << l2_hit << "!" << endl;
+                    assert(0);
+                }
+            }
+            else if (cache_type == IS_L2C) {
+                PACKET chk = *packet;
+                int l1d_hit = ooo_cpu[packet->cpu].L1D.check_hit(&chk);
+                int l1i_hit = ooo_cpu[packet->cpu].L1I.check_hit(&chk);
+                if (l1d_hit >= 0 || l1i_hit >= 0) {
+                    cerr << "[" << NAME << "_EXCLUSIVITY_ERROR] Address " << hex << packet->address << dec 
+                         << " filled in L2C but already present in L1D (" << l1d_hit << ") or L1I (" << l1i_hit << ")!" << endl;
+                    assert(0);
+                }
+            }
+#endif
+
             DP ( if (warmup_complete[packet->cpu] ) {
                     cout << "[" << NAME << "] " << __func__ << " set: " << set << " way: " << way;
                     cout << " lru: " << block[set][way].lru << " tag: " << hex << block[set][way].tag << " full_addr: " << block[set][way].full_addr;
@@ -2630,6 +2718,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         {
                             upper_level_dcache[packet->cpu]->return_data(packet);
                         }
+                        // EXCLUSIVE CACHE: Remove pending writeback from L2C WQ as data returned to L1
+                        WQ.remove_queue(&WQ.entry[wq_index]);
                     }
                     else
                     {
@@ -3316,6 +3406,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         {
                             upper_level_dcache[packet->cpu]->return_data(packet);
                         }
+                        // EXCLUSIVE CACHE: Remove pending writeback from L2C WQ as data returned to L1
+                        WQ.remove_queue(&WQ.entry[wq_index]);
                     }
                     else
                     {
